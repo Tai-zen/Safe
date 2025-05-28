@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anonymous Community Chat</title>
+  <link rel="stylesheet" href="/static/community.css" />
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const socket = io();
+
+  const chatMessages = document.getElementById("chat-messages");
+  const messageInput = document.getElementById("message-input");
+  const sendBtn = document.getElementById("send-btn");
+  const typingIndicator = document.getElementById("typing-indicator");
+
+  let typingTimeout;
+  let isTyping = false;
+  let mySessionId = null; // Will get from server or socket.id for own messages
+
+  // Helper: convert string (session id) to a consistent HSL color
+  function stringToColor(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return `hsl(${hash % 360}, 70%, 60%)`;
+  }
+
+  // Format timestamp to HH:mm
+  function formatTime(dateStr) {
+    const date = new Date(dateStr);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  // Append a message bubble with avatar, tail, and delivery ticks
+  function appendMessage({ id, text, timestamp, delivered, seen, isOwn }) {
+    const msgDiv = document.createElement("div");
+    msgDiv.classList.add("message");
+    msgDiv.classList.add(isOwn ? "sent" : "received");
+    msgDiv.id = `msg-${id}`;
+
+    // Avatar with color and initials
+    const avatar = document.createElement("div");
+    avatar.classList.add("avatar");
+    avatar.style.backgroundColor = stringToColor(id);
+    avatar.textContent = id.slice(0, 2).toUpperCase();
+
+    // Message bubble
+    const bubble = document.createElement("div");
+    bubble.classList.add("bubble");
+    bubble.textContent = text;
+
+    // Metadata (time + ticks)
+    const meta = document.createElement("div");
+    meta.classList.add("meta");
+    meta.textContent = formatTime(timestamp);
+
+    if (isOwn) {
+      const ticks = document.createElement("span");
+      ticks.classList.add("ticks");
+      ticks.innerHTML = seen
+        ? "&#10003;&#10003;"  // double tick - seen
+        : delivered
+        ? "&#10003;"         // single tick - delivered
+        : "&#9203;";         // hourglass - sending
+      meta.appendChild(ticks);
+    }
+
+    msgDiv.appendChild(avatar);
+    msgDiv.appendChild(bubble);
+    msgDiv.appendChild(meta);
+
+    chatMessages.appendChild(msgDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  // Load previous anonymous messages on page load
+  fetch("/anonymous_messages")
+    .then(res => res.json())
+    .then(messages => {
+      // If possible, set mySessionId as socket.id after connection
+      // But for now, we wait for socket connection event
+      messages.forEach(msg => {
+        appendMessage({
+          id: msg.session_id,
+          text: msg.message,
+          timestamp: msg.timestamp,
+          delivered: true,
+          seen: true,
+          isOwn: false
+        });
+      });
+    })
+    .catch(console.error);
+
+  // On socket connect, assign own session id
+  socket.on("connect", () => {
+    mySessionId = socket.id;
+  });
+
+  // Send message
+  function sendMessage() {
+    const message = messageInput.value.trim();
+    if (!message) return;
+
+    // Append own message optimistically
+    appendMessage({
+      id: "me",
+      text: message,
+      timestamp: new Date().toISOString(),
+      delivered: false,
+      seen: false,
+      isOwn: true,
+    });
+
+    socket.emit("send_message", message);
+    messageInput.value = "";
+    sendBtn.disabled = true;
+  }
+
+  sendBtn.addEventListener("click", sendMessage);
+
+  messageInput.addEventListener("input", () => {
+    sendBtn.disabled = messageInput.value.trim() === "";
+    emitTyping();
+  });
+
+  messageInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    } else {
+      emitTyping();
+    }
+  });
+
+  // Typing indicator debounce & emit
+  function emitTyping() {
+    if (!isTyping) {
+      isTyping = true;
+      socket.emit("typing", { isTyping: true });
+      clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        isTyping = false;
+        socket.emit("typing", { isTyping: false });
+      }, 1500);
+    } else {
+      clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        isTyping = false;
+        socket.emit("typing", { isTyping: false });
+      }, 1500);
+    }
+  }
+
+  // Handle new messages from others
+  socket.on("new_message", (data) => {
+    // Ignore own messages echoed back from server
+    if (data.session_id === mySessionId) return;
+
+    appendMessage({
+      id: data.session_id,
+      text: data.text,
+      timestamp: data.timestamp,
+      delivered: true,
+      seen: false,
+      isOwn: false,
+    });
+  });
+
+  // Typing updates from others
+  const typingUsers = new Set();
+
+  socket.on("typing", (data) => {
+    if (data.isTyping) {
+      typingUsers.add(data.session_id);
+    } else {
+      typingUsers.delete(data.session_id);
+    }
+    updateTypingIndicator();
+  });
+
+  function updateTypingIndicator() {
+    if (typingUsers.size === 0) {
+      typingIndicator.textContent = "";
+      typingIndicator.style.display = "none";
+    } else {
+      const usersArray = Array.from(typingUsers);
+      let text = "";
+      if (usersArray.length === 1) {
+        text = `User ${usersArray[0].slice(0, 4)} is typing...`;
+      } else {
+        text = `${usersArray.length} users are typing...`;
+      }
+      typingIndicator.textContent = text;
+      typingIndicator.style.display = "block";
+    }
+  }
+
+  // Update message delivery & seen ticks for own messages
+  socket.on("message_status", (data) => {
+    const msgDiv = document.getElementById("msg-me");
+    if (!msgDiv) return;
+
+    const ticks = msgDiv.querySelector(".ticks");
+    if (!ticks) return;
+
+    ticks.innerHTML = data.seen
+      ? "&#10003;&#10003;"
+      : data.delivered
+      ? "&#10003;"
+      : "&#9203;";
+  });
+});
+</script>
+
+
+</head>
+<body>
+  <div class="chat-container">
+    <header class="chat-header">
+      <h1>Anonymous Community</h1>
+    </header>
+
+    <main id="chat-messages" class="chat-messages"></main>
+
+    <div id="typing-indicator" class="typing-indicator" style="display:none"></div>
+
+    <form id="chat-form" class="chat-form">
+      <textarea id="message-input" placeholder="Type your message..." rows="1" autocomplete="off"></textarea>
+      <button id="send-btn" type="submit">Send</button>
+    </form>
+  </div>
+
+  <script src="community.js"></script>
+</body>
+</html>
